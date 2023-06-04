@@ -26,9 +26,13 @@ class OLearner():
 
         Parallel(n_jobs=self.n_jobs)(delayed(_balanced_fit)(i) for i in range(self.n_runs))
 
-    def cate(self, X):
+    def cate(self, X, mode='mean'):
         preds = np.zeros((X.shape[0], self.n_runs))
         for i, est in enumerate(self.est_all):
             preds[:, i] = est.effect(X)
 
-        return np.mean(preds, axis=1)
+        # Could also return std dev/err.
+        if mode == 'mean':
+            return np.mean(preds, axis=1)
+        elif mode == 'median':
+            return np.median(preds, axis=1)
