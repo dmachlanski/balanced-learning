@@ -19,8 +19,8 @@ class JOBS(object):
     def __init__(self, path_data="datasets/JOBS", n_iterations=10):
         self.path_data = path_data
         # Load train and test data from disk
-        self.train_data = np.load(self.path_data + "/jobs_DW_bin.train.npz")
-        self.test_data = np.load(self.path_data +"/jobs_DW_bin.test.npz")
+        self.train_data = np.load(self.path_data + "/jobs_DW_bin.new.10.train.npz")
+        self.test_data = np.load(self.path_data +"/jobs_DW_bin.new.10.test.npz")
         self.n_iterations = n_iterations
         self.logger = logging.getLogger('models.data.jobs')
         self.binfeats = [2, 3, 4, 5, 13, 14, 16]
