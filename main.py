@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from econml.dml import DML
 from econml.dr import DRLearner
-from econml.metalearners import XLearner, TLearner
+from econml.metalearners import XLearner, TLearner, SLearner
 from econml.grf import CausalForest
 from sklearn.ensemble import ExtraTreesRegressor, ExtraTreesClassifier
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
@@ -19,6 +19,8 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from lightgbm import LGBMRegressor, LGBMClassifier
 from models.data import IHDP, JOBS, NEWS, TWINS
+
+from models.estimators import OLearner
 
 class CausalForestWrapper(CausalForest):
     """ CausalForest doesn't work with GridSearchCV because CF.fit expects (X, T, Y) params,
@@ -75,6 +77,12 @@ def get_parser():
     parser.add_argument('--ebm', dest='estimation_base_model', type=str, choices=['lr', 'ridge', 'lasso', 'kr', 'et', 'dt', 'cb', 'lgbm'], default='lr')
     parser.add_argument('--ipw', dest='ipw_model', type=str, choices=['lr', 'kr', 'dt', 'et', 'cb', 'lgbm'], default='lr')
     parser.add_argument('--sfi', dest='save_features', action='store_true')
+
+    # Oversampled learning related
+    parser.add_argument('--ol', dest='olearner', action='store_true')
+    parser.add_argument('--tuning', type=str, choices=['once', 'every'])
+    parser.add_argument('--n_runs', type=int, default=10)
+    parser.add_argument('--t_frac', type=float, default=1.0)
 
     return parser
 
@@ -164,7 +172,7 @@ def _get_regressor(name, options):
     elif name == 'lasso':
         result = LassoLarsCV(cv=options.cv, n_jobs=1)
     elif name in ('dt', 'dt-ipw'):
-        params = {"max_leaf_nodes": [10, 20, 30, None], "max_depth": [5, 10, 20]}
+        params = {"max_leaf_nodes": [10, 20, 30, None], "max_depth": [2, 3, 4, 5, 10, 20]}
         result = GridSearchCV(DecisionTreeRegressor(random_state=options.seed), param_grid=params, scoring="neg_mean_squared_error", n_jobs=options.n_jobs, cv=options.cv)
     elif name in ('et', 'et-ipw'):
         params = {"max_leaf_nodes": [10, 20, 30, None], "max_depth": [5, 10, 20]}
@@ -181,6 +189,40 @@ def _get_regressor(name, options):
     else:
         raise ValueError('Unknown regressor chosen.')
     return result
+
+def _get_best_regressor(name, X, y, options):
+    return _get_regressor(name, options).fit(X, y).best_estimator_
+
+def _get_best_classifier(name, X, y, options):
+    return _get_classifier(name, options).fit(X, y).best_estimator_
+
+def _get_cate_estimator(name, X, t, y, options):
+    if name == 'sl':
+        if options.tuning == 'once':
+            reg = _get_best_regressor(options.estimation_base_model, np.hstack([X, t]), y, options)
+        else:
+            reg = _get_regressor(name, options)
+        est = SLearner(overall_model=reg)
+    elif name == 'tl':
+        if options.tuning == 'once':
+            c_idx = np.where(t == 0)[0]
+            t_idx = np.where(t == 1)[0]
+            reg_t0 = _get_best_regressor(options.estimation_base_model, X[c_idx], y[c_idx], options)
+            reg_t1 = _get_best_regressor(options.estimation_base_model, X[t_idx], y[t_idx], options)
+        else:
+            reg_t0 = _get_regressor(name, options)
+            reg_t1 = _get_regressor(name, options)
+        est = TLearner(models=[reg_t0, reg_t1])
+    else:
+        raise ValueError('Unrecognised CATE estimator!')
+
+    return est
+
+def _get_balanced_model(X, t, y, options):
+    est = _get_cate_estimator(options.estimation_model, X, t, y, options)
+    t_idx = np.where(t == 1)[0]
+    sample_size = int(len(t_idx) * options.t_frac)
+    return OLearner(est, options.n_runs, sample_size, 1)
 
 def _get_model(options):
     result = None
@@ -217,7 +259,11 @@ def estimate(train, test, options):
     Xt_train = np.concatenate([X_train, train[1].reshape(-1, 1)], axis=1)
     X_test = test[0]
     
-    model, fit_type = _get_model(options)
+    if options.olearner:
+        model = _get_balanced_model(X_train, t_train, y_train, options)
+        fit_type = 'olearner'
+    else:
+        model, fit_type = _get_model(options)
 
     if fit_type == 'econml':
         model.fit(Y=y_train, T=t_train, X=X_train)
@@ -228,6 +274,11 @@ def estimate(train, test, options):
         model.fit(X=X_train, T=t_train, y=y_train)
         te_tr = model.predict(X_train)
         te_test = model.predict(X_test)
+        result = te_tr, te_test
+    elif fit_type == 'olearner':
+        model.fit(X_train, t_train, y_train)
+        te_tr = model.cate(X_train)
+        te_test = model.cate(X_test)
         result = te_tr, te_test
     else: # 'sklearn'
         if 'ipw' in options.estimation_model:
