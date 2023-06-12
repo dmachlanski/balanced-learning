@@ -1,1 +1,1 @@
-from .oversampled_learning import OLearner
+from .oversampled_learning import OLearner, OLearnerCV

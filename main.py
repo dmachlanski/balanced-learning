@@ -13,6 +13,7 @@ from sklearn.ensemble import ExtraTreesRegressor, ExtraTreesClassifier
 from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.dummy import DummyRegressor
+from sklearn.metrics import mean_squared_error
 from catboost import CatBoostRegressor, CatBoostClassifier
 from sklearn.linear_model import LassoLarsCV, RidgeCV, LinearRegression, LogisticRegressionCV
 from sklearn.model_selection import GridSearchCV
@@ -20,7 +21,7 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from lightgbm import LGBMRegressor, LGBMClassifier
 from models.data import IHDP, JOBS, NEWS, TWINS
 
-from models.estimators import OLearner
+from models.estimators import OLearner, OLearnerCV
 
 class CausalForestWrapper(CausalForest):
     """ CausalForest doesn't work with GridSearchCV because CF.fit expects (X, T, Y) params,
@@ -43,6 +44,18 @@ class KernelRidgeClassifier(KernelRidge):
     def predict_proba(self, X):
         p = self.predict(X).reshape(-1, 1)
         return np.concatenate([1 - p, p], axis=1)
+
+class SLearnerMod(SLearner):
+    def score(self, X, t, y):
+        t_2d = t.reshape(-1, 1)
+        return -mean_squared_error(y.flatten(), self.overall_model.predict(np.hstack([X, 1-t_2d, t_2d])))
+        #return self.overall_model.score(np.hstack([X, 1-t_2d, t_2d]), y)
+
+class TLearnerMod(TLearner):
+    def score(self, X, t, y):
+        scores = [-mean_squared_error(y[t == i], m.predict(X[t == i])) for i, m in enumerate(self.models)]
+        #scores = [m.score(X[t == i], y[t == i]) for i, m in enumerate(self.models)]
+        return np.mean(scores)
 
 def get_scaler(name):
     result = None
@@ -73,7 +86,7 @@ def get_parser():
     parser.add_argument('--cv', type=int, default=5)
 
     # Estimation
-    parser.add_argument('--em', type=str, dest='estimation_model', choices=['dml', 'dr', 'xl', 'tl', 'cf', 'ridge', 'ridge-ipw', 'lasso', 'kr', 'kr-ipw', 'et', 'et-ipw', 'dt', 'dt-ipw', 'cb', 'cb-ipw', 'lgbm', 'lgbm-ipw', 'lr', 'lr-ipw', 'dummy'])
+    parser.add_argument('--em', type=str, dest='estimation_model', choices=['dml', 'dr', 'xl', 'sl', 'tl', 'cf', 'ridge', 'ridge-ipw', 'lasso', 'kr', 'kr-ipw', 'et', 'et-ipw', 'dt', 'dt-ipw', 'cb', 'cb-ipw', 'lgbm', 'lgbm-ipw', 'lr', 'lr-ipw', 'dummy'])
     parser.add_argument('--ebm', dest='estimation_base_model', type=str, choices=['lr', 'ridge', 'lasso', 'kr', 'et', 'dt', 'cb', 'lgbm'], default='lr')
     parser.add_argument('--ipw', dest='ipw_model', type=str, choices=['lr', 'kr', 'dt', 'et', 'cb', 'lgbm'], default='lr')
     parser.add_argument('--sfi', dest='save_features', action='store_true')
@@ -83,6 +96,7 @@ def get_parser():
     parser.add_argument('--tuning', type=str, choices=['once', 'every'])
     parser.add_argument('--n_runs', type=int, default=10)
     parser.add_argument('--t_frac', type=float, default=1.0)
+    parser.add_argument('--ocv', type=int, default=-1)
 
     return parser
 
@@ -170,7 +184,8 @@ def _get_regressor(name, options):
     elif name == 'lr':
         result = LinearRegression(n_jobs=1)
     elif name == 'lasso':
-        result = LassoLarsCV(cv=options.cv, n_jobs=1)
+        #result = GridSearchCV(LassoLarsCV(cv=options.cv, n_jobs=options.n_jobs), param_grid={'max_iter': [10, 20, 100]}, n_jobs=1, cv=options.cv)
+        result = LassoLarsCV(cv=options.cv, n_jobs=options.n_jobs)
     elif name in ('dt', 'dt-ipw'):
         params = {"max_leaf_nodes": [10, 20, 30, None], "max_depth": [2, 3, 4, 5, 10, 20]}
         result = GridSearchCV(DecisionTreeRegressor(random_state=options.seed), param_grid=params, scoring="neg_mean_squared_error", n_jobs=options.n_jobs, cv=options.cv)
@@ -199,10 +214,10 @@ def _get_best_classifier(name, X, y, options):
 def _get_cate_estimator(name, X, t, y, options):
     if name == 'sl':
         if options.tuning == 'once':
-            reg = _get_best_regressor(options.estimation_base_model, np.hstack([X, t]), y, options)
+            reg = _get_best_regressor(options.estimation_base_model, np.hstack([X, t.reshape(-1, 1)]), y, options)
         else:
-            reg = _get_regressor(name, options)
-        est = SLearner(overall_model=reg)
+            reg = _get_regressor(options.estimation_base_model, options)
+        est = SLearnerMod(overall_model=reg)
     elif name == 'tl':
         if options.tuning == 'once':
             c_idx = np.where(t == 0)[0]
@@ -210,9 +225,9 @@ def _get_cate_estimator(name, X, t, y, options):
             reg_t0 = _get_best_regressor(options.estimation_base_model, X[c_idx], y[c_idx], options)
             reg_t1 = _get_best_regressor(options.estimation_base_model, X[t_idx], y[t_idx], options)
         else:
-            reg_t0 = _get_regressor(name, options)
-            reg_t1 = _get_regressor(name, options)
-        est = TLearner(models=[reg_t0, reg_t1])
+            reg_t0 = _get_regressor(options.estimation_base_model, options)
+            reg_t1 = _get_regressor(options.estimation_base_model, options)
+        est = TLearnerMod(models=[reg_t0, reg_t1])
     else:
         raise ValueError('Unrecognised CATE estimator!')
 
@@ -220,9 +235,10 @@ def _get_cate_estimator(name, X, t, y, options):
 
 def _get_balanced_model(X, t, y, options):
     est = _get_cate_estimator(options.estimation_model, X, t, y, options)
-    t_idx = np.where(t == 1)[0]
-    sample_size = int(len(t_idx) * options.t_frac)
-    return OLearner(est, options.n_runs, sample_size, 1)
+    if options.ocv > 0:
+        return OLearnerCV(est, options.ocv, n_jobs=1)
+    else:
+        return OLearner(est, options.n_runs, options.t_frac, 1)
 
 def _get_model(options):
     result = None
@@ -277,6 +293,7 @@ def estimate(train, test, options):
         result = te_tr, te_test
     elif fit_type == 'olearner':
         model.fit(X_train, t_train, y_train)
+        #print(model.best_params_)
         te_tr = model.cate(X_train)
         te_test = model.cate(X_test)
         result = te_tr, te_test
